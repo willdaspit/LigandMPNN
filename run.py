@@ -609,8 +609,11 @@ def main(args) -> None:
                     
                     out_struct = gemmi.Structure()
                     out_struct.add_model(out_model)
-                    out_struct.write_pdb(output_backbones + name + "_" + str(ix_suffix) + args.file_ending + ".pdb",
-                                         gemmi.PdbWriteOptions(cryst1_record=False, ter_ignores_type=True))
+                    filename = output_backbones + name + "_" + str(ix_suffix) + args.file_ending
+                    out_struct.write_pdb(filename + ".pdb",
+                                         gemmi.PdbWriteOptions(cryst1_record=False))
+                    cif = out_struct.make_mmcif_document()
+                    cif.write_file(filename + ".cif")
                     
                     # write full PDB files
                     if args.pack_side_chains:
@@ -626,8 +629,7 @@ def main(args) -> None:
                                 + str(ix_suffix)
                                 + "_"
                                 + str(c_pack + 1)
-                                + args.file_ending
-                                + ".pdb",
+                                + args.file_ending,
                                 X_stack[ix].cpu().numpy(),
                                 X_m_stack[ix].cpu().numpy(),
                                 b_factor_stack[ix].cpu().numpy(),

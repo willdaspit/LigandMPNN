@@ -478,7 +478,9 @@ def write_full_PDB(
 
     out_struct = gemmi.Structure()
     out_struct.add_model(out_model)
-    out_struct.write_pdb(save_path, gemmi.PdbWriteOptions(cryst1_record=False))
+    out_struct.write_pdb(save_path + ".pdb", gemmi.PdbWriteOptions(cryst1_record=False))
+    cif = out_struct.make_mmcif_document()
+    cif.write_file(save_path + ".cif")
     
 
 def parse_PDB(
