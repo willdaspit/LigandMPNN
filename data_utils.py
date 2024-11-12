@@ -777,7 +777,7 @@ def parse_PDB(
         CRAs += [cra for cra in model.all() if
                 (not chains or cra.chain in chains) and
                 (parse_atoms_with_zero_occupancy or cra.atom.occ > 0) and
-                cra.atom.altloc in ["\x00", "", "A"]]  # TODO how does original handle altlocs?
+                cra.atom.altloc in ["\x00", "", "A"]]
     
     
     protein_cras = [cra for cra in CRAs if cra.residue.name in restype_3to1]
