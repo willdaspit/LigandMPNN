@@ -7,6 +7,8 @@ import sys
 
 import numpy as np
 import torch
+import gemmi
+
 from data_utils import (
     alphabet,
     element_dict_rev,
@@ -20,7 +22,6 @@ from data_utils import (
     write_full_PDB,
 )
 from model_utils import ProteinMPNN
-from prody import writePDB
 from sc_utils import Packer, pack_side_chains
 
 
@@ -195,7 +196,8 @@ def main(args) -> None:
         parse_all_atoms_flag = args.ligand_mpnn_use_side_chain_context or (
             args.pack_side_chains and not args.repack_everything
         )
-        protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
+        
+        protein_dict, backbone, other_atoms, icodes, _, structure = parse_PDB(
             pdb,
             device=device,
             chains=parse_these_chains_only_list,
@@ -358,13 +360,12 @@ def main(args) -> None:
                 symmetry_weights.append(tmp_w_list)
 
         # set other atom bfactors to 0.0
-        if other_atoms:
-            other_bfactors = other_atoms.getBetas()
-            other_atoms.setBetas(other_bfactors * 0.0)
+        for cra in other_atoms:
+            cra.atom.b_iso = 0
 
-        # adjust input PDB name by dropping .pdb if it does exist
+        # adjust input PDB name by dropping extension if it does exist
         name = pdb[pdb.rfind("/") + 1 :]
-        if name[-4:] == ".pdb":
+        if name[-4:] == ".pdb" or name[-4:] == ".cif":
             name = name[:-4]
 
         with torch.no_grad():
@@ -422,7 +423,7 @@ def main(args) -> None:
                     device=device,
                 )
                 output_dict = model.sample(feature_dict)
-
+                
                 # compute confidence scores
                 loss, loss_per_residue = get_score(
                     output_dict["S"],
@@ -576,38 +577,41 @@ def main(args) -> None:
                     )
 
                     # write new sequences into PDB with backbone coordinates
-                    seq_prody = np.array([restype_1to3[AA] for AA in list(seq)])[
-                        None,
-                    ].repeat(4, 1)
-                    bfactor_prody = (
-                        loss_per_residue_stack[ix].cpu().numpy()[None, :].repeat(4, 1)
-                    )
-                    backbone.setResnames(seq_prody)
-                    backbone.setBetas(
-                        np.exp(-bfactor_prody)
-                        * (bfactor_prody > 0.01).astype(np.float32)
-                    )
-                    if other_atoms:
-                        writePDB(
-                            output_backbones
-                            + name
-                            + "_"
-                            + str(ix_suffix)
-                            + args.file_ending
-                            + ".pdb",
-                            backbone + other_atoms,
-                        )
-                    else:
-                        writePDB(
-                            output_backbones
-                            + name
-                            + "_"
-                            + str(ix_suffix)
-                            + args.file_ending
-                            + ".pdb",
-                            backbone,
-                        )
+                    bfactor_np = (loss_per_residue_stack[ix].cpu().numpy()[None, :].repeat(4))
+                    for i, cra in enumerate(backbone):
+                        newAA = seq[cra.residue.seqid.num-1]
+                        cra.residue.name = restype_1to3[newAA]
+                        bfactor = bfactor_np[i]
+                        cra.atom.b_iso = np.exp(-bfactor) * (bfactor > .01).astype(np.float32)
 
+                    out_model = gemmi.Model(structure[0].name)
+                    # We need to do things a little oddly since it seems adding
+                    # atoms to a residue after residue is in the chain doesn't properly stick.
+                    residues_for_chain = {}  # Chain name -> {residue key -> residue}
+                    for cra in backbone + other_atoms:
+                        if cra.chain.name not in residues_for_chain:
+                            residues_for_chain[cra.chain.name] = {}
+                        res_key = str(cra.residue.seqid) + "_" + cra.residue.entity_id
+                        if res_key not in residues_for_chain[cra.chain.name]:
+                            residue = cra.residue.clone()
+                            del residue[:]  # Copy everything about the residue except the atoms.
+
+                            residues_for_chain[cra.chain.name][res_key] = residue
+                            
+                        # Re-add just the relevant atoms.
+                        residues_for_chain[cra.chain.name][res_key].add_atom(cra.atom)
+                        
+                    for chain_name in residues_for_chain:
+                        chain = gemmi.Chain(chain_name)
+                        for residue_key in residues_for_chain[chain_name]:
+                            chain.add_residue(residues_for_chain[chain_name][residue_key])
+                        out_model.add_chain(chain)
+                    
+                    out_struct = gemmi.Structure()
+                    out_struct.add_model(out_model)
+                    out_struct.write_pdb(output_backbones + name + "_" + str(ix_suffix) + args.file_ending + ".pdb",
+                                         gemmi.PdbWriteOptions(cryst1_record=False, ter_ignores_type=True))
+                    
                     # write full PDB files
                     if args.pack_side_chains:
                         for c_pack in range(args.number_of_packs_per_design):
@@ -634,6 +638,7 @@ def main(args) -> None:
                                 icodes=icodes,
                                 force_hetatm=args.force_hetatm,
                             )
+                            
                     # -----
 
                     # write fasta lines

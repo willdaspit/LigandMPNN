@@ -3,9 +3,7 @@ from __future__ import print_function
 import numpy as np
 import torch
 import torch.utils
-from prody import *
-
-confProDy(verbosity="none")
+import gemmi
 
 restype_1to3 = {
     "A": "ALA",
@@ -433,83 +431,55 @@ def write_full_PDB(
     }
 
     S_str = [restype_1to3[AA] for AA in [restype_INTtoSTR[AA] for AA in S]]
-
-    X_list = []
-    b_factor_list = []
-    atom_name_list = []
-    element_name_list = []
-    residue_name_list = []
-    residue_number_list = []
-    chain_id_list = []
-    icodes_list = []
+    
+    out_model = gemmi.Model("")
+    residues_for_chain = {}  # Chain name -> [residues]
     for i, AA in enumerate(S_str):
-        sel = X_m[i].astype(np.int32) == 1
-        total = np.sum(sel)
-        tmp = np.array(restype_name_to_atom14_names[AA])[sel]
-        X_list.append(X[i][sel])
-        b_factor_list.append(b_factors[i][sel])
-        atom_name_list.append(tmp)
-        element_name_list += [AA[:1] for AA in list(tmp)]
-        residue_name_list += total * [AA]
-        residue_number_list += total * [R_idx[i]]
-        chain_id_list += total * [chain_letters[i]]
-        icodes_list += total * [icodes[i]]
+        chain_name = chain_letters[i]
+        if chain_name not in residues_for_chain:
+            residues_for_chain[chain_name] = []
 
-    X_stack = np.concatenate(X_list, 0)
-    b_factor_stack = np.concatenate(b_factor_list, 0)
-    atom_name_stack = np.concatenate(atom_name_list, 0)
+        residue = gemmi.Residue()
+        residues_for_chain[chain_name].append(residue)
+        residue.seqid = gemmi.SeqId(R_idx[i], icodes[i] if icodes[i] else " ")
+        residue.name = AA
+        
+        for j, atom_name in enumerate(restype_name_to_atom14_names[AA]):
+            if not atom_name:  # 14 long lists padded with empty strings.
+                break
+            
+            atom = gemmi.Atom()
+            atom.name = atom_name
+            atom.element = gemmi.Element(atom_name[:1])
+            atom.b_iso = b_factors[i,j]
+            atom.pos = gemmi.Position(*X[i,j].tolist())
+            residue.add_atom(atom)
+    
+    for cra in other_atoms:
+        chain_name = cra.chain.name
+        if chain_name not in residues_for_chain:
+            residues_for_chain[chain_name] = []
+        
+        for residue in residues_for_chain[chain_name]:
+            if residue.seqid == cra.residue.seqid:
+                break
+        else:
+            residue = cra.residue.clone()
+            del residue[:]
+            residues_for_chain[chain_name].append(residue)
+        
+        residue.add_atom(cra.atom)
+    
+    for chain_name in residues_for_chain:
+        chain = gemmi.Chain(chain_name)
+        for residue in residues_for_chain[chain_name]:
+            chain.add_residue(residue)
+        out_model.add_chain(chain)
 
-    protein = prody.AtomGroup()
-    protein.setCoords(X_stack)
-    protein.setBetas(b_factor_stack)
-    protein.setNames(atom_name_stack)
-    protein.setResnames(residue_name_list)
-    protein.setElements(element_name_list)
-    protein.setOccupancies(np.ones([X_stack.shape[0]]))
-    protein.setResnums(residue_number_list)
-    protein.setChids(chain_id_list)
-    protein.setIcodes(icodes_list)
-
-    if other_atoms:
-        other_atoms_g = prody.AtomGroup()
-        other_atoms_g.setCoords(other_atoms.getCoords())
-        other_atoms_g.setNames(other_atoms.getNames())
-        other_atoms_g.setResnames(other_atoms.getResnames())
-        other_atoms_g.setElements(other_atoms.getElements())
-        other_atoms_g.setOccupancies(other_atoms.getOccupancies())
-        other_atoms_g.setResnums(other_atoms.getResnums())
-        other_atoms_g.setChids(other_atoms.getChids())
-        if force_hetatm:
-            other_atoms_g.setFlags("hetatm", other_atoms.getFlags("hetatm"))
-        writePDB(save_path, protein + other_atoms_g)
-    else:
-        writePDB(save_path, protein)
-
-
-def get_aligned_coordinates(protein_atoms, CA_dict: dict, atom_name: str):
-    """
-    protein_atoms: prody atom group
-    CA_dict: mapping between chain_residue_idx_icodes and integers
-    atom_name: atom to be parsed; e.g. CA
-    """
-    atom_atoms = protein_atoms.select(f"name {atom_name}")
-
-    if atom_atoms != None:
-        atom_coords = atom_atoms.getCoords()
-        atom_resnums = atom_atoms.getResnums()
-        atom_chain_ids = atom_atoms.getChids()
-        atom_icodes = atom_atoms.getIcodes()
-
-    atom_coords_ = np.zeros([len(CA_dict), 3], np.float32)
-    atom_coords_m = np.zeros([len(CA_dict)], np.int32)
-    if atom_atoms != None:
-        for i in range(len(atom_resnums)):
-            code = atom_chain_ids[i] + "_" + str(atom_resnums[i]) + "_" + atom_icodes[i]
-            if code in list(CA_dict):
-                atom_coords_[CA_dict[code], :] = atom_coords[i]
-                atom_coords_m[CA_dict[code]] = 1
-    return atom_coords_, atom_coords_m
-
+    out_struct = gemmi.Structure()
+    out_struct.add_model(out_model)
+    out_struct.write_pdb(save_path, gemmi.PdbWriteOptions(cryst1_record=False))
+    
 
 def parse_PDB(
     input_path: str,
@@ -732,6 +702,30 @@ def parse_PDB(
         "NZ": 35,
         "OXT": 36,
     }
+    
+    restype_3to1 = {
+        "ALA": "A",
+        "ARG": "R",
+        "ASN": "N",
+        "ASP": "D",
+        "CYS": "C",
+        "GLN": "Q",
+        "GLU": "E",
+        "GLY": "G",
+        "HIS": "H",
+        "ILE": "I",
+        "LEU": "L",
+        "LYS": "K",
+        "MET": "M",
+        "PHE": "F",
+        "PRO": "P",
+        "SER": "S",
+        "THR": "T",
+        "TRP": "W",
+        "TYR": "Y",
+        "VAL": "V",
+    }
+
 
     if not parse_all_atoms:
         atom_types = ["N", "CA", "C", "O"]
@@ -775,36 +769,44 @@ def parse_PDB(
             "NZ",
         ]
 
-    atoms = parsePDB(input_path)
-    if not parse_atoms_with_zero_occupancy:
-        atoms = atoms.select("occupancy > 0")
-    if chains:
-        str_out = ""
-        for item in chains:
-            str_out += " chain " + item + " or"
-        atoms = atoms.select(str_out[1:-3])
-
-    protein_atoms = atoms.select("protein")
-    backbone = protein_atoms.select("backbone")
-    other_atoms = atoms.select("not protein and not water")
-    water_atoms = atoms.select("water")
-
-    CA_atoms = protein_atoms.select("name CA")
-    CA_resnums = CA_atoms.getResnums()
-    CA_chain_ids = CA_atoms.getChids()
-    CA_icodes = CA_atoms.getIcodes()
-
-    CA_dict = {}
-    for i in range(len(CA_resnums)):
-        code = CA_chain_ids[i] + "_" + str(CA_resnums[i]) + "_" + CA_icodes[i]
-        CA_dict[code] = i
-
-    xyz_37 = np.zeros([len(CA_dict), 37, 3], np.float32)
-    xyz_37_m = np.zeros([len(CA_dict), 37], np.int32)
+    structure = gemmi.read_structure(input_path)  # Works with cif or pdb, detected by file extension.
+    CRAs = []
+    for model in structure:
+        CRAs += [cra for cra in model.all() if
+                (not chains or cra.chain in chains) and
+                (parse_atoms_with_zero_occupancy or cra.atom.occ > 0) and
+                cra.atom.altloc in ["\x00", "", "A"]]  # TODO how does original handle altlocs?
+    
+    
+    protein_cras = [cra for cra in CRAs if cra.residue.name in restype_3to1]
+    backbone = [cra for cra in protein_cras if (cra.atom.name in ["N", "CA", "C", "O"])]
+    other_cras = [cra for cra in CRAs if cra.residue.name not in restype_3to1 and not cra.residue.is_water()]
+    water_cras = [cra for cra in CRAs if cra.residue.is_water()]
+    
+    CA_cras = [cra for cra in protein_cras if cra.atom.name == "CA"]
+    CA_residues = []
+    chains = []
+    for model in structure:
+        for chain in model:
+            chains.append(chain)
+            for res in chain:
+                if res.get_ca():
+                    CA_residues.append(res)
+    
+    xyz_37 = np.zeros([len(CA_residues), 37, 3], np.float32)
+    xyz_37_m = np.zeros([len(CA_residues), 37], np.int32)
+    seen_residues = {}
     for atom_name in atom_types:
-        xyz, xyz_m = get_aligned_coordinates(protein_atoms, CA_dict, atom_name)
-        xyz_37[:, atom_order[atom_name], :] = xyz
-        xyz_37_m[:, atom_order[atom_name]] = xyz_m
+        matching_cras = [cra for cra in protein_cras if cra.atom.name == atom_name]
+        for cra in matching_cras:
+            if cra.residue.get_ca():
+                key = cra.chain.name + str(cra.residue.seqid)
+                if key not in seen_residues:
+                    seen_residues[key] = len(seen_residues)
+                index = seen_residues[key]
+                xyz_37[index, atom_order[atom_name], :] = cra.atom.pos.tolist()
+                xyz_37_m[index, atom_order[atom_name]] = 1
+                index += 1
 
     N = xyz_37[:, atom_order["N"], :]
     CA = xyz_37[:, atom_order["CA"], :]
@@ -818,21 +820,15 @@ def parse_PDB(
 
     mask = N_m * CA_m * C_m * O_m  # must all 4 atoms exist
 
-    b = CA - N
-    c = C - CA
-    a = np.cross(b, c, axis=-1)
-    CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
-
-    chain_labels = np.array(CA_atoms.getChindices(), dtype=np.int32)
-    R_idx = np.array(CA_resnums, dtype=np.int32)
-    S = CA_atoms.getResnames()
-    S = [restype_3to1[AA] if AA in list(restype_3to1) else "X" for AA in list(S)]
+    R_idx = np.array([res.seqid.num for res in CA_residues], dtype=np.int32)
+    S = [cra.residue.name for cra in CA_cras]
+    S = [restype_3to1[AA] if AA in restype_3to1 else "X" for AA in S]
     S = np.array([restype_STRtoINT[AA] for AA in list(S)], np.int32)
     X = np.concatenate([N[:, None], CA[:, None], C[:, None], O[:, None]], 1)
 
-    try:
-        Y = np.array(other_atoms.getCoords(), dtype=np.float32)
-        Y_t = list(other_atoms.getElements())
+    if other_cras:
+        Y = np.array([cra.atom.pos.tolist() for cra in other_cras], dtype=np.float32)
+        Y_t = [cra.atom.element.name for cra in other_cras]
         Y_t = np.array(
             [
                 element_dict[y_t.upper()] if y_t.upper() in element_list else 0
@@ -841,11 +837,10 @@ def parse_PDB(
             dtype=np.int32,
         )
         Y_m = (Y_t != 1) * (Y_t != 0)
-
         Y = Y[Y_m, :]
         Y_t = Y_t[Y_m]
         Y_m = Y_m[Y_m]
-    except:
+    else:
         Y = np.zeros([1, 3], np.float32)
         Y_t = np.zeros([1], np.int32)
         Y_m = np.zeros([1], np.int32)
@@ -858,11 +853,8 @@ def parse_PDB(
     output_dict["Y_m"] = torch.tensor(Y_m, device=device, dtype=torch.int32)
 
     output_dict["R_idx"] = torch.tensor(R_idx, device=device, dtype=torch.int32)
-    output_dict["chain_labels"] = torch.tensor(
-        chain_labels, device=device, dtype=torch.int32
-    )
-
-    output_dict["chain_letters"] = CA_chain_ids
+    output_dict["chain_labels"] = torch.tensor([chains.index(cra.chain) for cra in CA_cras], device=device, dtype=torch.int32)
+    output_dict["chain_letters"] = np.array([cra.chain.name for cra in CA_cras])
 
     mask_c = []
     chain_list = list(set(output_dict["chain_letters"]))
@@ -884,7 +876,10 @@ def parse_PDB(
     output_dict["xyz_37"] = torch.tensor(xyz_37, device=device, dtype=torch.float32)
     output_dict["xyz_37_m"] = torch.tensor(xyz_37_m, device=device, dtype=torch.int32)
 
-    return output_dict, backbone, other_atoms, CA_icodes, water_atoms
+    CA_icodes = np.array([ca.residue.seqid.icode.strip() for ca in CA_cras])
+    
+    # We need to return the parent structure as well to avoid things being garbage collected.
+    return output_dict, backbone, other_cras, CA_icodes, water_cras, structure
 
 
 def get_nearest_neighbours(CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms):
